@@ -7,7 +7,9 @@ use reqwest::Client;
 use serde_derive::{Deserialize, Serialize};
 use serde_xml_rs::{from_str, to_string};
 use std::collections::HashMap;
-use std::str;
+use std::io::Cursor;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
+use tokio_util::io::ReaderStream;
 
 use crate::bucket::{Bucket, ListBuckets};
 use crate::errors::ObjectError;
@@ -22,6 +24,7 @@ pub struct OSS {
     endpoint: String,
     bucket: String,
     pub client: Client,
+    speed_limiter: async_speed_limit::Limiter,
 }
 
 const RESOURCES: [&str; 50] = [
@@ -85,6 +88,24 @@ impl OSS {
             endpoint: endpoint,
             bucket: bucket,
             client: reqwest::Client::new(),
+            speed_limiter: async_speed_limit::Limiter::new(f64::INFINITY),
+        }
+    }
+
+    pub fn with_limiter(
+        key_id: String,
+        key_secret: String,
+        endpoint: String,
+        bucket: String,
+        speed_limiter: async_speed_limit::Limiter,
+    ) -> Self {
+        OSS {
+            key_id: key_id,
+            key_secret: key_secret,
+            endpoint: endpoint,
+            bucket: bucket,
+            client: reqwest::Client::new(),
+            speed_limiter,
         }
     }
 
@@ -398,10 +419,16 @@ impl OSS {
         );
         headers.insert("Authorization", authorization.parse().unwrap());
 
+        let body = reqwest::Body::wrap_stream(ReaderStream::new(
+            self.speed_limiter
+                .clone()
+                .limit(Cursor::new(buf.to_owned())),
+        ));
+
         let res = reqwest::Client::new()
             .put(&host)
             .headers(headers)
-            .body(buf.to_owned())
+            .body(body)
             .send()
             .await?;
         Ok(res.bytes().await?)
@@ -421,7 +448,7 @@ impl OSS {
         H: Into<Option<HashMap<S3, S3>>>,
         R: Into<Option<HashMap<S3, Option<S3>>>>,
     {
-        let mut file = tokio::fs::File::open(file.as_ref()).await?;
+        let file = tokio::fs::File::open(file.as_ref()).await?;
         let object_name = object_name.as_ref();
         let resources_str = if let Some(r) = resources.into() {
             self.get_resources_str(r)
@@ -430,14 +457,16 @@ impl OSS {
         };
         let host = self.host(self.bucket(), object_name, &resources_str);
         let date = self.date();
-        let buf = load_file(&mut file).await?;
         let mut headers = if let Some(h) = headers.into() {
             to_headers(h)?
         } else {
             HeaderMap::new()
         };
         headers.insert(DATE, date.parse()?);
-        headers.insert(CONTENT_LENGTH, buf.len().to_string().parse()?);
+        headers.insert(
+            CONTENT_LENGTH,
+            file.metadata().await?.len().to_string().parse()?,
+        );
         let authorization = self.oss_sign(
             "PUT",
             self.key_id(),
@@ -449,11 +478,14 @@ impl OSS {
         );
         headers.insert("Authorization", authorization.parse()?);
 
+        let body =
+            reqwest::Body::wrap_stream(ReaderStream::new(self.speed_limiter.clone().limit(file)));
+
         let resp = self
             .client
             .put(&host)
             .headers(headers)
-            .body(buf)
+            .body(body)
             .send()
             .await?;
 
@@ -522,7 +554,7 @@ impl OSS {
     // https://help.aliyun.com/document_detail/31993.html
     async fn upload_part<S1, S2, H>(
         &self,
-        file: &mut tokio::fs::File,
+        file: &tokio::fs::File,
         object_name: S1,
         chunk: FileChunk,
         upload_id: String,
@@ -555,15 +587,20 @@ impl OSS {
             &headers,
         );
         headers.insert("Authorization", authorization.parse()?);
+        headers.insert(CONTENT_LENGTH, chunk.size.to_string().parse()?);
 
-        let buf = load_chunk_file(file, chunk.offset, chunk.size).await?;
-        headers.insert(CONTENT_LENGTH, buf.len().to_string().parse()?);
+        let mut file = file.try_clone().await?;
+        file.seek(SeekFrom::Start(chunk.offset)).await?;
+
+        let body = reqwest::Body::wrap_stream(ReaderStream::new(
+            self.speed_limiter.clone().limit(file.take(chunk.size)),
+        ));
 
         let resp = self
             .client
             .put(&host)
             .headers(headers)
-            .body(buf)
+            .body(body)
             .send()
             .await?;
 
@@ -685,7 +722,7 @@ impl OSS {
         S1: AsRef<str>,
         H: Into<Option<HashMap<S1, S1>>>,
     {
-        let mut file = tokio::fs::File::open(file.as_ref()).await?;
+        let file = tokio::fs::File::open(file.as_ref()).await?;
         // chunk object
         let chunks = split_file_by_part_size(&file, chunk_size).await?;
         if chunks.is_empty() {
@@ -699,7 +736,7 @@ impl OSS {
         for chunk in chunks {
             let etag = match self
                 .upload_part(
-                    &mut file,
+                    &file,
                     object_name,
                     chunk.clone(),
                     upload_id.clone(),

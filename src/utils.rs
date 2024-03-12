@@ -3,24 +3,6 @@ use reqwest::header::{HeaderMap, HeaderName};
 use std::collections::HashMap;
 use std::vec;
 use tokio::fs::File;
-use tokio::io::BufReader;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
-
-#[inline]
-pub async fn load_file(f: &mut File) -> Result<Vec<u8>, Error> {
-    let mut f = BufReader::new(f);
-    let mut s = Vec::new();
-    f.read_to_end(&mut s).await?;
-    Ok(s)
-}
-
-#[inline]
-pub async fn load_chunk_file(f: &mut File, offset: u64, size: u64) -> Result<Vec<u8>, Error> {
-    let mut buf = Vec::with_capacity(size as usize);
-    f.seek(SeekFrom::Start(offset)).await?;
-    f.take(size).read_to_end(&mut buf).await?;
-    Ok(buf)
-}
 
 pub fn to_headers<S>(hashmap: HashMap<S, S>) -> Result<HeaderMap, Error>
 where
@@ -92,12 +74,5 @@ mod tests {
         let res = split_file_by_part_size(&f, 1024).await;
         // println!("res: {:?}", res.unwrap());
         assert!(res.is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_load_chunk_file() {
-        let mut f = tokio::fs::File::open("/tmp/tmp.txt").await.unwrap();
-        let data = load_chunk_file(&mut f, 0, 100).await.unwrap();
-        println!("data: {:?}", data);
     }
 }
